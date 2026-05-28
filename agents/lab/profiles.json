@@ -1,0 +1,50 @@
+{
+  "lite": {
+    "books": 4,
+    "duration_ns": 10800000000000,
+    "blockCount": 2,
+    "ckptNumWorkers": 2,
+    "gracePeriod_ns": 15000000000,
+    "remoteAgentCount": 32,
+    "noise_traders": 256,
+    "stylized_traders": 200,
+    "init_agents": 100,
+    "futures_traders": 25,
+    "hft_traders": 4,
+    "magnetic_rows": 16,
+    "trial_wall_seconds": 90,
+    "description": "4 books, reduced background agents — 8-core / ≤16GB"
+  },
+  "medium": {
+    "books": 8,
+    "duration_ns": 21600000000000,
+    "blockCount": 3,
+    "ckptNumWorkers": 3,
+    "gracePeriod_ns": 20000000000,
+    "remoteAgentCount": 96,
+    "noise_traders": 512,
+    "stylized_traders": 500,
+    "init_agents": 250,
+    "futures_traders": 50,
+    "hft_traders": 8,
+    "magnetic_rows": 24,
+    "trial_wall_seconds": 120,
+    "description": "8 books, moderate load — 6+ cores / 12GB+"
+  },
+  "full": {
+    "books": 16,
+    "duration_ns": 43200000000000,
+    "blockCount": 4,
+    "ckptNumWorkers": 4,
+    "gracePeriod_ns": 30000000000,
+    "remoteAgentCount": 264,
+    "noise_traders": 1024,
+    "stylized_traders": 1000,
+    "init_agents": 500,
+    "futures_traders": 100,
+    "hft_traders": 10,
+    "magnetic_rows": 32,
+    "trial_wall_seconds": 180,
+    "description": "16 books, near-live density — 12+ cores / 24GB+"
+  }
+}

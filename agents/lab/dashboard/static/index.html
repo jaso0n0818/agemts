@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>τaos Local Lab</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0c0f14;
+      --panel: #141a24;
+      --text: #e8ecf4;
+      --muted: #8b95a8;
+      --accent: #3dd6c6;
+      --warn: #f0b429;
+      --bad: #f07178;
+      --good: #7fd962;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid #1e2736;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      align-items: baseline;
+      justify-content: space-between;
+    }
+    h1 { margin: 0; font-size: 1.25rem; font-weight: 600; letter-spacing: 0.02em; }
+    .badge {
+      background: #1e2736;
+      padding: 0.25rem 0.6rem;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .badge strong { color: var(--accent); }
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      padding: 1rem 1.5rem 2rem;
+    }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    .panel {
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 1rem;
+      border: 1px solid #1e2736;
+    }
+    .panel h2 {
+      margin: 0 0 0.75rem;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 0.75rem;
+    }
+    .metric {
+      background: #0c0f14;
+      padding: 0.6rem 0.75rem;
+      border-radius: 6px;
+    }
+    .metric label { display: block; font-size: 0.7rem; color: var(--muted); }
+    .metric span { font-size: 1.35rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #1e2736; }
+    th { color: var(--muted); font-weight: 500; }
+    .full { grid-column: 1 / -1; }
+    #log {
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+      max-height: 160px;
+      overflow-y: auto;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .phase-running { color: var(--good); }
+    .phase-trial { color: var(--warn); }
+    .phase-idle { color: var(--muted); }
+    canvas { max-height: 220px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>τaos Local Lab — MedianAlignedTierAgent</h1>
+    <div>
+      <span class="badge">Profile: <strong id="profile">—</strong></span>
+      <span class="badge">Phase: <strong id="phase" class="phase-idle">idle</strong></span>
+      <span class="badge">갱신: <strong>10초</strong></span>
+      <span class="badge">Updated: <strong id="updated">—</strong></span>
+    </div>
+  </header>
+  <main>
+    <section class="panel full">
+      <h2>Live metrics</h2>
+      <div class="metrics">
+        <div class="metric"><label>Score median</label><span id="scoreMedian">0</span></div>
+        <div class="metric"><label>Active books</label><span id="booksActive">0</span></div>
+        <div class="metric"><label>Round trips</label><span id="roundTrips">0</span></div>
+        <div class="metric"><label>Respond (ms)</label><span id="respondMs">0</span></div>
+        <div class="metric"><label>Proxy step</label><span id="proxyStep">0</span></div>
+        <div class="metric"><label>Instr / tick</label><span id="instrTick">0</span></div>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Score history</h2>
+      <canvas id="chartScore"></canvas>
+    </section>
+    <section class="panel">
+      <h2>Latency (ms)</h2>
+      <canvas id="chartLatency"></canvas>
+    </section>
+    <section class="panel">
+      <h2>Per-book</h2>
+      <table>
+        <thead><tr><th>Book</th><th>Tier</th><th>Score</th><th>Pos</th><th>RTs</th></tr></thead>
+        <tbody id="bookTable"></tbody>
+      </table>
+    </section>
+    <section class="panel">
+      <h2>Trials / leaderboard</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Score</th><th>q</th><th>α</th><th>def</th></tr></thead>
+        <tbody id="trialTable"></tbody>
+      </table>
+      <p id="bestTrial" style="margin-top:0.75rem;font-size:0.85rem;color:var(--accent)"></p>
+    </section>
+    <section class="panel full">
+      <h2>Current trial</h2>
+      <pre id="currentTrial" style="margin:0;font-size:0.8rem;color:var(--muted)">—</pre>
+    </section>
+    <section class="panel full">
+      <h2>Log</h2>
+      <div id="log"></div>
+    </section>
+  </main>
+  <script>
+    const scoreHist = [];
+    const latHist = [];
+    const maxPts = 60;
+
+    const chartScore = new Chart(document.getElementById("chartScore"), {
+      type: "line",
+      data: { labels: [], datasets: [{ label: "score_median", data: [], borderColor: "#3dd6c6", tension: 0.2, fill: false }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { min: 0, max: 1 } } }
+    });
+    const chartLatency = new Chart(document.getElementById("chartLatency"), {
+      type: "line",
+      data: { labels: [], datasets: [{ label: "ms", data: [], borderColor: "#f0b429", tension: 0.2, fill: false }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { display: false } } }
+    });
+
+    function pushChart(chart, val) {
+      chart.data.labels.push("");
+      chart.data.datasets[0].data.push(val);
+      if (chart.data.labels.length > maxPts) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+      }
+      chart.update("none");
+    }
+
+    function render(state) {
+      const live = state.live || {};
+      document.getElementById("profile").textContent = state.profile || "—";
+      const ph = document.getElementById("phase");
+      ph.textContent = state.phase || "idle";
+      ph.className = "phase-" + (state.phase || "idle");
+      document.getElementById("updated").textContent = state.updated_at
+        ? new Date(state.updated_at * 1000).toLocaleTimeString() : "—";
+
+      document.getElementById("scoreMedian").textContent = (live.score_median ?? 0).toFixed(3);
+      document.getElementById("booksActive").textContent = live.books_active ?? 0;
+      document.getElementById("roundTrips").textContent = live.round_trips ?? 0;
+      document.getElementById("respondMs").textContent = (live.respond_ms ?? 0).toFixed(0);
+      document.getElementById("proxyStep").textContent = live.proxy_step ?? 0;
+      document.getElementById("instrTick").textContent = live.orders_last_tick ?? 0;
+
+      if (live.score_median != null) pushChart(chartScore, live.score_median);
+      if (live.respond_ms != null) pushChart(chartLatency, live.respond_ms);
+
+      const tbody = document.getElementById("bookTable");
+      tbody.innerHTML = "";
+      const pb = live.per_book || {};
+      Object.keys(pb).sort((a,b)=>+a-+b).forEach(bid => {
+        const r = pb[bid];
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${bid}</td><td>${r.tier}</td><td>${r.score_proxy}</td><td>${r.position}</td><td>${r.round_trips}</td>`;
+        tbody.appendChild(tr);
+      });
+
+      const tt = document.getElementById("trialTable");
+      tt.innerHTML = "";
+      (state.trials || []).slice().reverse().slice(0, 12).forEach(t => {
+        const p = t.params || {};
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${t.id}</td><td>${t.score}</td><td>${p.quantity ?? ""}</td><td>${p.alpha_fraction ?? ""}</td><td>${p.defensive_fraction ?? ""}</td>`;
+        tt.appendChild(tr);
+      });
+
+      const best = state.best_trial;
+      document.getElementById("bestTrial").textContent = best
+        ? `Best: ${best.id} score=${best.score} params=${JSON.stringify(best.params)}`
+        : "";
+
+      document.getElementById("currentTrial").textContent = state.current_trial
+        ? JSON.stringify(state.current_trial, null, 2) : "—";
+
+      document.getElementById("log").innerHTML = (state.log_tail || []).map(l => `<div>${l}</div>`).join("");
+    }
+
+    const REFRESH_MS = 10000;
+
+    function pull() {
+      fetch("/api/state").then(r => r.json()).then(render).catch(() => {});
+    }
+
+    pull();
+    setInterval(pull, REFRESH_MS);
+
+    const es = new EventSource("/api/stream");
+    es.onmessage = (e) => {
+      try { render(JSON.parse(e.data)); } catch (_) {}
+    };
+  </script>
+</body>
+</html>

@@ -8,11 +8,25 @@ cd simulate/trading
 if [ ! -d "vcpkg" ]; then
 	git clone https://github.com/microsoft/vcpkg.git
 fi
-cd vcpkg && git reset --hard 83972272512ce4ede5fc3b2ba98f6468b179f192 && cd ..
+# Must match simulate/trading/vcpkg.json "builtin-baseline" (same as install_validator.sh)
+cd vcpkg && git reset --hard e140b1fde236eb682b0d47f905e65008a191800f && cd ..
 apt-get install -y curl zip unzip tar make pkg-config autoconf autoconf-archive libcurl4-openssl-dev
 ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
-python -m pip install -e .
+# pip: sudo often lacks `python`; taos (repo root) should be installed in user venv first.
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+if command -v python3 >/dev/null 2>&1; then
+	PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+	PYTHON=python
+else
+	PYTHON=""
+	echo "WARN: no python3/python in PATH — skip pip. Run as user: cd $REPO_ROOT && source .venv/bin/activate && pip install -e ."
+fi
+if [ -n "$PYTHON" ]; then
+	$PYTHON -m pip install -e "$REPO_ROOT" || echo "WARN: pip install taos failed (continue if already installed in venv)"
+	$PYTHON -m pip install -e . || echo "WARN: pip install taosim failed (optional for C++ binary)"
+fi
 
 . /etc/lsb-release
 echo "Ubuntu Version $DISTRIB_RELEASE"

@@ -1,0 +1,32 @@
+{
+    "proxy": {
+        "port": 8000,
+        "simulation_xml": "../../simulate/trading/run/config/simulation_lab_medium.xml",
+        "timeout": 5
+    },
+    "agents": {
+        "path": "..",
+        "start_port": 8888,
+        "MedianAlignedTierAgent": [
+            {
+                "params": {
+                    "mainnet_mode": 1,
+                    "quantity": 0.25,
+                    "max_quantity": 0.75,
+                    "expiry_period": 30000000000,
+                    "lazy_load": 1,
+                    "max_instructions_per_book": 4,
+                    "min_refresh_interval": 10000000000,
+                    "volume_soft_cap": 0.80,
+                    "min_realized_observations": 3,
+                    "network_median_kappa_hint": 0.10,
+                    "emergency_unwind": 1,
+                    "vpin_threshold": 0.62,
+                    "toxic_refresh_factor": 0.45,
+                    "toxic_max_cancels": 2
+                },
+                "count": 1
+            }
+        ]
+    }
+}

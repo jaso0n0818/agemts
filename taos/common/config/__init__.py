@@ -30,7 +30,7 @@ class ParseKwargs(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, argparse.Namespace())
         for value in values:
-            key, value = value.split('=')
+            key, value = value.split('=', 1)
             try:
                 value = float(value)
             except:

@@ -37,7 +37,24 @@ class Proxy(Validator):
         base_config = copy.deepcopy(BaseNeuron.config())
         self.config = self.config()
         self.config.merge(base_config)
-        self.config.neuron.timeout = config['proxy']['timeout']
+        if getattr(self.config, "scoring", None) is None:
+            self.config.scoring = argparse.Namespace(
+                min_delay=0,
+                max_delay=0,
+                min_instruction_delay=0,
+                max_instruction_delay=0,
+            )
+        if getattr(self.config, "neuron", None) is None:
+            # bittensor>=10 may leave neuron unset when parsing empty CLI defaults.
+            self.config.neuron = argparse.Namespace(
+                name="proxy",
+                timeout=float(launcher_config["proxy"]["timeout"]),
+                device="cpu",
+                dont_save_events=True,
+                events_retention_size="100 MB",
+            )
+        else:
+            self.config.neuron.timeout = launcher_config["proxy"]["timeout"]
         self.check_config(self.config)
         config_file = launcher_config['proxy']['simulation_xml']
         if not os.path.exists(config_file):
@@ -46,8 +63,8 @@ class Proxy(Validator):
         self.simulation_config = self.load_simulation_config()
 
         self.agent_urls = {}
-        port = config['agents']['start_port']
-        for agent, agent_configs in config['agents'].items():
+        port = launcher_config['agents']['start_port']
+        for agent, agent_configs in launcher_config['agents'].items():
             if agent in ['start_port', 'path']: continue
             for agent_config in agent_configs:
                 base_agent_name = f"{agent}_{'_'.join(list([str(a) for a in agent_config['params'].values()]))}"
@@ -77,6 +94,9 @@ class Proxy(Validator):
         Returns:
             None
         """
+        if os.environ.get("TAOS_PROXY_SKIP_SEED"):
+            bt.logging.info("Skipping Coinbase seed thread (TAOS_PROXY_SKIP_SEED=1)")
+            return
         from taos.im.validator.seed import seed_thread
         
         # Wrap seed in try-except to prevent thread crashes
@@ -167,6 +187,26 @@ class Proxy(Validator):
                     bt.logging.error(f"{agent} | Failed to validate response : {e}")
         agent_responses = set_delays(self, synapse_responses)
         simulator_response = SimulatorResponseBatch(agent_responses).serialize()
+        elapsed_ms = (time.time() - receive_start) * 1000.0
+        if os.environ.get("TAOS_LAB_METRICS"):
+            try:
+                from lab.metrics import publish_proxy_tick
+
+                instr_count = 0
+                for _uid, synapse in synapse_responses.items():
+                    ar = synapse.response
+                    if ar is None:
+                        continue
+                    instr_count += len(getattr(ar, "instructions", []) or [])
+                publish_proxy_tick(
+                    step=self.step,
+                    sim_timestamp=state.timestamp,
+                    respond_ms=elapsed_ms,
+                    orders=instr_count,
+                    cancels=0,
+                )
+            except Exception:
+                pass
         bt.logging.info(f"State update handled ({time.time()-receive_start}s)")
         return simulator_response
 

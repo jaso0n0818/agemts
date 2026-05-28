@@ -3,6 +3,8 @@
 import asyncio
 import json
 import argparse
+import os
+import sys
 from datetime import datetime
 from functools import wraps
 from loguru import logger
@@ -31,11 +33,13 @@ async def watch(name, stream, stderr=False):
 
 async def launch_proxy(config_file):
     try:
+        env = {**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
         proc = await asyncio.create_subprocess_exec(
-            "python", "proxy.py", "--config", config_file,
+            sys.executable, "proxy.py", "--config", config_file,
             limit = 1024 * 512,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         # This is required for SIGINT to also kill the subprocess.
         await asyncio.gather(watch("PROXY", proc.stdout), watch("PROXY", proc.stderr, True))
@@ -49,11 +53,13 @@ async def launch_proxy(config_file):
 async def launch_agent(name, args):
     try:
         logger.info(f"Launching agent {name}")
+        env = {**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
         proc = await asyncio.create_subprocess_exec(
-            "python", *args,
+            sys.executable, *args,
             limit = 1024 * 512,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         # This is required for SIGINT to also kill the subprocess.
         await asyncio.gather(watch(name, proc.stdout), watch(name, proc.stderr, True))

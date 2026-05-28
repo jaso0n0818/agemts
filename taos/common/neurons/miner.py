@@ -181,16 +181,14 @@ class BaseMinerNeuron(BaseNeuron):
 
         Otherwise, allow the request to be processed further.
         """
-        uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        if (
-            not self.config.blacklist.allow_non_registered
-            and synapse.dendrite.hotkey not in self.metagraph.hotkeys
-        ):
-            # Ignore requests from un-registered entities.
-            bt.logging.trace(
-                f"Blacklisting un-registered hotkey {synapse.dendrite.hotkey}"
-            )
-            return True, "Unrecognized hotkey"
+        hotkey = synapse.dendrite.hotkey
+        if hotkey not in self.metagraph.hotkeys:
+            if not self.config.blacklist.allow_non_registered:
+                bt.logging.trace(f"Blacklisting un-registered hotkey {hotkey}")
+                return True, "Unrecognized hotkey"
+            return False, "Hotkey recognized!"
+
+        uid = self.metagraph.hotkeys.index(hotkey)
 
         if not self.config.blacklist.allow_non_validators:
             # If the config is set to force validator permit, then we should only allow requests from validators.
@@ -225,9 +223,10 @@ class BaseMinerNeuron(BaseNeuron):
         Example priority logic:
         - A higher stake results in a higher priority value.
         """
-        caller_uid = self.metagraph.hotkeys.index(
-            synapse.dendrite.hotkey
-        )  # Get the caller index.
+        hotkey = synapse.dendrite.hotkey
+        if hotkey not in self.metagraph.hotkeys:
+            return 0.0
+        caller_uid = self.metagraph.hotkeys.index(hotkey)
         priority = float(
             self.metagraph.S[caller_uid]
         )  # Return the stake as the priority.
