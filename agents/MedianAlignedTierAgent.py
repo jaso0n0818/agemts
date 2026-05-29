@@ -204,6 +204,15 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         self.kappa_norm_max = float(getattr(self.config, "kappa_norm_max", 2.5))
         # Align score_proxy with validator's kappa_3 (tau is typically 0).
         self.kappa_tau = float(getattr(self.config, "kappa_tau", 0.0))
+        self.kappa_proxy_mu_boost = float(
+            getattr(self.config, "kappa_proxy_mu_boost", 1.10)
+        )
+        self.kappa_proxy_downside_weight = float(
+            getattr(self.config, "kappa_proxy_downside_weight", 0.75)
+        )
+        self.kappa_proxy_regularization_scale = float(
+            getattr(self.config, "kappa_proxy_regularization_scale", 0.08)
+        )
         self.min_realized_observations = int(
             getattr(self.config, "min_realized_observations", 3)
         )
@@ -211,6 +220,20 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         self.signal_window = int(getattr(self.config, "signal_window", 120))
         self.defensive_activity_margin = float(
             getattr(self.config, "defensive_activity_margin", 0.08)
+        )
+        # Dashboard shows activity is already healthy; avoid over-triggering DEFENSIVE
+        # on small proxy differences while still catching real left-tail books.
+        self.defensive_entry_buffer = float(
+            getattr(self.config, "defensive_entry_buffer", 0.025)
+        )
+        self.defensive_quantity_mult = float(
+            getattr(self.config, "defensive_quantity_mult", 0.90)
+        )
+        self.defensive_max_volume_ratio = float(
+            getattr(self.config, "defensive_max_volume_ratio", 0.60)
+        )
+        self.defensive_inventory_mult = float(
+            getattr(self.config, "defensive_inventory_mult", 0.82)
         )
         self.alpha_absolute_min = float(
             getattr(
@@ -605,9 +628,9 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             )
         if tier == BookTier.DEFENSIVE:
             return TierParams(
-                quantity_mult=0.72,
-                max_volume_ratio=0.48,
-                inventory_limit=self.base_inventory_limit * 0.65,
+                quantity_mult=self.defensive_quantity_mult,
+                max_volume_ratio=self.defensive_max_volume_ratio,
+                inventory_limit=self.base_inventory_limit * self.defensive_inventory_mult,
                 force_activity=True,
             )
         return TierParams(
@@ -953,13 +976,19 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         upm3 = float(np.power(upside, 3).mean())
 
         typical_scale = abs(mu) + float(np.std(r))
-        regularization = float(np.power(typical_scale * 0.1, 3))
+        regularization = float(
+            np.power(typical_scale * self.kappa_proxy_regularization_scale, 3)
+        )
         epsilon = 1e-2 if mu > tau else 1e-6
+        edge = mu - tau
+        if edge > 0:
+            edge *= self.kappa_proxy_mu_boost
+        downside_penalty = max(self.kappa_proxy_downside_weight, 0.05)
 
         if lpm3 > epsilon:
-            raw_kappa = (mu - tau) / float(np.cbrt(lpm3 + regularization))
+            raw_kappa = edge / float(np.cbrt((lpm3 * downside_penalty) + regularization))
         elif mu > tau:
-            raw_kappa = (mu - tau) / float(np.cbrt(upm3 + regularization))
+            raw_kappa = edge / float(np.cbrt(upm3 + regularization))
         else:
             raw_kappa = 0.0
 
@@ -1258,13 +1287,18 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         tier_by_book: dict[int, BookTier] = {}
         prev_tiers = self._tier_prev.get(validator, {})
         h = self.tier_hysteresis
+        entry_buffer = max(0.0, self.defensive_entry_buffer)
+        weak_cut = self.weak_book_proxy_floor - entry_buffer
         for book_id, proxy, obs in rows:
             peer_ratio = peer_ratio_by_book.get(book_id, 0.0)
             prev = prev_tiers.get(book_id)
             if obs < self.min_realized_observations:
                 tier_by_book[book_id] = (
                     BookTier.DEFENSIVE
-                    if proxy <= net.book_score_p25
+                    if (
+                        proxy <= net.book_score_p25 - entry_buffer
+                        or peer_ratio >= self.peer_volume_defensive_ratio
+                    )
                     else BookTier.NEUTRAL
                 )
                 continue
@@ -1277,12 +1311,12 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             ):
                 tier_by_book[book_id] = BookTier.ALPHA
             elif (
-                proxy <= defensive_cut
-                or proxy < self.weak_book_proxy_floor
+                proxy <= defensive_cut - entry_buffer
+                or proxy < weak_cut
                 or peer_ratio >= self.peer_volume_defensive_ratio
                 or (
                     not net.alpha_unlocked
-                    and proxy < net.book_score_median
+                    and proxy < net.book_score_median - entry_buffer
                 )
             ):
                 tier_by_book[book_id] = BookTier.DEFENSIVE
@@ -1292,7 +1326,7 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
                 if proxy >= alpha_cut - h:
                     tier_by_book[book_id] = BookTier.ALPHA
             elif prev == BookTier.DEFENSIVE and tier_by_book[book_id] != BookTier.DEFENSIVE:
-                if proxy <= defensive_cut + h:
+                if proxy <= defensive_cut + max(h * 0.5, entry_buffer):
                     tier_by_book[book_id] = BookTier.DEFENSIVE
 
         alpha_ids = sorted(
@@ -2659,8 +2693,11 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             elif signal.flow <= -self.flow_threshold and signal.depth_imbalance <= 0:
                 allow_bid = False
         elif signal.regime == "trend" and tier == BookTier.DEFENSIVE:
-            allow_bid = allow_bid and signal.flow <= self.flow_threshold * 0.5
-            allow_ask = allow_ask and signal.flow >= -self.flow_threshold * 0.5
+            # Defensive should still participate unless flow is clearly one-sided.
+            # The trend guard remains, but is less hair-trigger so activity/kappa
+            # observations do not stall on merely noisy books.
+            allow_bid = allow_bid and signal.flow <= self.flow_threshold * 0.85
+            allow_ask = allow_ask and signal.flow >= -self.flow_threshold * 0.85
         if (
             tier == BookTier.ALPHA
             and ctx.net.alpha_unlocked
