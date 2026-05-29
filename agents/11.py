@@ -16,11 +16,10 @@ Architecture (organic ensemble):
   - WARM: onTrade refreshes score snapshot between validator requests
 """
 
-from collections import Counter, defaultdict, deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 import os
-import time
 
 import bittensor as bt
 import numpy as np
@@ -70,11 +69,10 @@ class BookFingerprint:
     last_plan_ts: int = 0
     flow_signed_volumes: deque = field(default_factory=lambda: _deque(40))
     last_emergency_ts: int = 0
-    last_market_close_ts: int = 0
+    # Last observed fill timestamp (maker or taker). Used to detect "dead" books.
+    last_fill_ts: int = 0
     # Maker fills since last respond — skip cancel on IDs already gone (saves instruction budget).
     recent_maker_fill_ids: set[int] = field(default_factory=set)
-    # IDs confirmed gone by cancel failure/success notices; filters stale account snapshots.
-    dead_order_ids: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -167,8 +165,7 @@ class TickContext:
     peer_ratio_by_book: dict[int, float] = field(default_factory=dict)
     fleet_inventory_skew: float = 0.0
     plans: dict[int, BookActionPlan] = field(default_factory=dict)
-    small_books: set[int] = field(default_factory=set)
-    profit_books: set[int] = field(default_factory=set)
+    focus_books: set[int] = field(default_factory=set)
 
 
 class MedianAlignedTierAgent(FinanceSimulationAgent):
@@ -253,13 +250,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         self.max_inactive_books_ratio = float(
             getattr(self.config, "max_inactive_books_ratio", 0.375)
         )
-        # When coverage pressure rises, avoid pushing "dead books" where passive maker quotes
-        # can get stuck indefinitely (very wide spreads / low fill probability). This is a
-        # scoring-stability guard: it reduces min-roundtrip-volume stagnation and prevents
-        # left-tail outlier collapse.
-        self.coverage_push_max_relative_spread = float(
-            getattr(self.config, "coverage_push_max_relative_spread", 0.02)
-        )
         self.coverage_safety_margin = float(
             getattr(self.config, "coverage_safety_margin", 0.05)
         )
@@ -300,6 +290,19 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         self.roundtrip_complete_only_when_cold = bool(
             int(getattr(self.config, "roundtrip_complete_only_when_cold", 1))
         )
+        # Focus books (worst 1–N): complete round-trips faster to raise min_roundtrip_volume.
+        _default_focus_add = 2 if self.mainnet_mode else 0
+        self.focus_roundtrip_complete_ticks_add = int(
+            getattr(self.config, "focus_roundtrip_complete_ticks_add", _default_focus_add)
+        )
+        # Focus books: if a book stays totally flat and cold/under-active, maker quotes can
+        # fail to get filled for long periods on low-liquidity books. Optionally force a
+        # tiny taker trade (market) to "seed" activity; subsequent logic will try to
+        # complete the round-trip and/or force-close after timeout.
+        _default_focus_force_trade = 0  # disabled unless explicitly enabled
+        self.focus_force_trade_after = int(
+            getattr(self.config, "focus_force_trade_after", _default_focus_force_trade)
+        )
         # Fast bootstrap: if a book holds inventory too long without completing a round-trip,
         # force a small flatten to generate realized PnL observations (Kappa unlock) and help
         # keep some books recently active for validator activity sampling.
@@ -313,15 +316,10 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         self.force_roundtrip_close_cancel_all = bool(
             int(getattr(self.config, "force_roundtrip_close_cancel_all", 1))
         )
-        self.force_roundtrip_close_min_return = (
-            float(getattr(self.config, "force_roundtrip_close_min_return_bps", 0.5))
-            / 10_000
-        )
-        self.roundtrip_min_profit = (
-            float(getattr(self.config, "roundtrip_min_profit_bps", 0.5)) / 10_000
-        )
-        self.market_close_reentry_cooldown = int(
-            getattr(self.config, "market_close_reentry_cooldown", 30_000_000_000)
+        # Reduce churn: on mainnet, only force-close on focus books by default.
+        _default_force_focus_only = 1 if self.mainnet_mode else 0
+        self.force_roundtrip_close_focus_only = bool(
+            int(getattr(self.config, "force_roundtrip_close_focus_only", _default_force_focus_only))
         )
         # Min sim time between full quote refresh (reduces cancel storms).
         self.min_refresh_interval = int(
@@ -374,62 +372,12 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         # Validator tolerates up to ~37.5% inactive books; targeting ~80/128 keeps us above
         # the threshold while concentrating volume to unlock per-book Kappa faster.
         self.active_books_target = int(getattr(self.config, "active_books_target", 0))
-        self.active_books_min_ratio = float(
-            getattr(self.config, "active_books_min_ratio", 1.0 - self.max_inactive_books_ratio)
-        )
-        self.active_books_target_margin = int(
-            getattr(self.config, "active_books_target_margin", 0)
-        )
         self._active_books_by_validator: dict[str, set[int]] = defaultdict(set)
-        self._small_books_by_validator: dict[str, set[int]] = defaultdict(set)
-        self._profit_books_by_validator: dict[str, set[int]] = defaultdict(set)
-        self.small_book_reserve_fraction = float(
-            getattr(self.config, "small_book_reserve_fraction", 0.70)
-        )
-        self.profit_book_reserve_fraction = float(
-            getattr(self.config, "profit_book_reserve_fraction", 0.25)
-        )
-        self.small_book_volume_percentile = float(
-            getattr(self.config, "small_book_volume_percentile", 40.0)
-        )
-        self.small_book_activity_period = int(
-            getattr(self.config, "small_book_activity_period", 90_000_000_000)
-        )
-        self.small_book_requote_interval = int(
-            getattr(self.config, "small_book_requote_interval", 5_000_000_000)
-        )
-        self.small_book_roundtrip_ticks_add = int(
-            getattr(self.config, "small_book_roundtrip_ticks_add", 2)
-        )
-        self.small_book_min_profit = (
-            float(getattr(self.config, "small_book_min_profit_bps", 0.05)) / 10_000
-        )
-        self.small_book_force_close_after = int(
-            getattr(self.config, "small_book_force_close_after", 30_000_000_000)
-        )
-        self.small_book_force_close_min_return = (
-            float(getattr(self.config, "small_book_force_close_min_return_bps", 0.05))
-            / 10_000
-        )
-        self.small_book_max_cancels = int(
-            getattr(self.config, "small_book_max_cancels", 1)
-        )
-        self.profit_book_min_proxy = float(
-            getattr(self.config, "profit_book_min_proxy", 0.62)
-        )
-        self.profit_book_size_mult = float(
-            getattr(self.config, "profit_book_size_mult", 1.25)
-        )
-        self.profit_book_min_profit = (
-            float(getattr(self.config, "profit_book_min_profit_bps", 0.35)) / 10_000
-        )
-        self.profit_book_force_close_after = int(
-            getattr(self.config, "profit_book_force_close_after", 90_000_000_000)
-        )
-        self.profit_book_force_close_min_return = (
-            float(getattr(self.config, "profit_book_force_close_min_return_bps", 0.35))
-            / 10_000
-        )
+        # Ensure the worst 1–N books (by "kappa readiness") stay inside the active set so
+        # validator `min_roundtrip_volume = min(book_roundtrip_volume)` can actually rise.
+        _default_focus = 3 if self.mainnet_mode else 0
+        self.focus_books_target = int(getattr(self.config, "focus_books_target", _default_focus))
+        self._last_focus_log_ts: dict[str, int] = {}
         # Tight-spread / competitive-book protection (postOnly + STP.CANCEL_BOTH checks).
         self.postonly_buffer_ticks = int(
             getattr(
@@ -457,33 +405,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         self._warm_snapshots: dict[str, dict] = defaultdict(dict)
         self._volume_scan_cache: dict[str, dict] = {}
         self._respond_seq: dict[str, int] = defaultdict(int)
-        self._update_seq: dict[str, int] = defaultdict(int)
-        self._timing_seq: dict[str, int] = defaultdict(int)
-        self._compact_report_seq: dict[str, int] = defaultdict(int)
-        self._last_response_metrics: dict[str, dict] = defaultdict(dict)
-        self.fast_scoring_mode = bool(int(getattr(self.config, "fast_scoring_mode", 0)))
-        self.peer_scan_enabled = bool(
-            int(getattr(self.config, "peer_scan_enabled", 0 if self.fast_scoring_mode else 1))
-        )
-        self.portfolio_scan_enabled = bool(
-            int(
-                getattr(
-                    self.config,
-                    "portfolio_scan_enabled",
-                    0 if self.fast_scoring_mode else 1,
-                )
-            )
-        )
-        self.event_log_interval = int(getattr(self.config, "event_log_interval", 50))
-        self.response_timing_interval = int(
-            getattr(self.config, "response_timing_interval", 20)
-        )
-        self.slow_response_warn_s = float(
-            getattr(self.config, "slow_response_warn_s", 0.35)
-        )
-        self.compact_report_interval = int(
-            getattr(self.config, "compact_report_interval", 20)
-        )
 
     def _sync_min_order_size_from_sim(self) -> None:
         """Ensure we never submit sizes below simulator minOrderSize (mainnet is strict)."""
@@ -496,100 +417,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             return
         if mos_f > 0 and self.min_order_size < mos_f:
             self.min_order_size = mos_f
-
-    def update(self, state: MarketSimulationStateUpdate) -> None:
-        """
-        Lightweight hot-path state update.
-
-        The base class builds very large per-book log strings and scans events as
-        book x events. For mainnet serving we only need fresh accounts plus a
-        single pass over our notices to update inventory/PnL fingerprints.
-        """
-        validator = state.dendrite.hotkey
-        self.history.append(state)
-        self.history = self.history[-2:]
-        self.simulation_config = state.config
-        self.accounts = state.accounts.get(self.uid, {})
-        self.events = state.notices.get(self.uid, [])
-
-        counts = Counter()
-        reject_messages = Counter()
-
-        def mark_dead_order(event_obj) -> None:
-            book_id = getattr(event_obj, "bookId", None)
-            order_id = getattr(event_obj, "orderId", None)
-            if book_id is None or order_id is None:
-                return
-            fp = self._fingerprint(validator, int(book_id))
-            fp.dead_order_ids.add(int(order_id))
-            if len(fp.dead_order_ids) > 4096:
-                fp.dead_order_ids.clear()
-
-        for event in self.events:
-            etype = event.type
-            counts[etype] += 1
-            if etype in {"EVENT_SIMULATION_START", "ESS"}:
-                self.onStart(event)
-            elif etype in {"EVENT_SIMULATION_END", "ESE"}:
-                self.onEnd(event)
-            elif etype in {"EVENT_TRADE", "ET"}:
-                self.onTrade(event, validator)
-            elif etype in {
-                "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT",
-                "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET",
-                "ERDPOL",
-                "ERDPOM",
-            }:
-                reject_messages[str(getattr(event, "message", ""))] += 1
-                self.onOrderRejected(event)
-            elif etype in {"ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS", "ERDCO"}:
-                cancellations = getattr(event, "cancellations", []) or []
-                if cancellations:
-                    for cancellation in cancellations:
-                        reject_messages[
-                            str(getattr(cancellation, "message", ""))
-                        ] += 1
-                        mark_dead_order(cancellation)
-                        self.onOrderCancellationFailed(cancellation)
-                else:
-                    reject_messages[str(getattr(event, "message", ""))] += 1
-            elif etype in {"RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT", "RDPOL"}:
-                book_id = getattr(event, "bookId", None)
-                order_id = getattr(event, "orderId", None)
-                if book_id is not None and order_id is not None:
-                    self._fingerprint(validator, int(book_id)).dead_order_ids.discard(
-                        int(order_id)
-                    )
-                self.onOrderAccepted(event)
-            elif etype in {"RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET", "RDPOM"}:
-                self.onOrderAccepted(event)
-            elif etype in {"RESPONSE_DISTRIBUTED_CANCEL_ORDERS", "RDCO"}:
-                for cancellation in getattr(event, "cancellations", []) or []:
-                    mark_dead_order(cancellation)
-                    self.onOrderCancelled(cancellation)
-            elif etype in {"RESPONSE_DISTRIBUTED_CLOSE_POSITIONS", "RDCP"}:
-                for close in getattr(event, "closes", []) or []:
-                    self.onPositionClosed(close)
-            elif etype in {"ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS", "ERDCP"}:
-                reject_messages[str(getattr(event, "message", ""))] += 1
-                for close in getattr(event, "closes", []) or []:
-                    self.onPositionCloseFailed(close)
-
-        seq = self._update_seq[validator]
-        self._update_seq[validator] = seq + 1
-        meaningful_rejects = Counter(
-            {key: value for key, value in reject_messages.items() if key}
-        )
-        if self.event_log_interval > 0 and (
-            seq % self.event_log_interval == 0 or meaningful_rejects
-        ):
-            trades = counts.get("EVENT_TRADE", 0) + counts.get("ET", 0)
-            bt.logging.info(
-                "AGENT_UPDATE "
-                f"events={len(self.events)} trades={trades} "
-                f"rejects={sum(reject_messages.values())} "
-                f"reject_top={reject_messages.most_common(3)}"
-            )
 
     def _fingerprint(self, validator: str, book_id: int) -> BookFingerprint:
         return self.fingerprints[validator][book_id]
@@ -651,216 +478,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         pressure = min(1.0, gap / max(target * 0.15, 0.04))
         return ready_ratio, pressure
 
-    def _active_target_size(self, book_count: int) -> int:
-        if not self.active_books_target or self.active_books_target <= 0:
-            return book_count
-        min_ratio = max(0.0, min(1.0, self.active_books_min_ratio))
-        min_target = int(np.ceil(book_count * min_ratio))
-        min_target = min(book_count, min_target + self.active_books_target_margin)
-        return min(max(int(self.active_books_target), min_target), book_count)
-
-    def _book_recent_pnl_mean(self, fingerprint: BookFingerprint, tail: int = 8) -> float:
-        pnls = list(fingerprint.round_trip_pnls)
-        if not pnls:
-            return 0.0
-        return float(np.mean(pnls[-tail:]))
-
-    def _fast_active_book_ids(
-        self,
-        validator: str,
-        book_ids: list[int],
-        timestamp: int,
-        net: NetworkContext,
-    ) -> list[int]:
-        """Pick the active set before expensive per-book signal construction."""
-        target = self._active_target_size(len(book_ids))
-        if target >= len(book_ids):
-            selected = list(book_ids)
-            self._small_books_by_validator[validator], self._profit_books_by_validator[validator] = (
-                self._classify_activity_lanes(validator, selected, timestamp, target)
-            )
-            return selected
-        period = self._effective_activity_period(net.coverage_pressure)
-        selected: list[int] = []
-        seen: set[int] = set()
-        my_by_book, _ = self._my_volumes(book_ids)
-        volumes = [my_by_book.get(book_id, 0.0) for book_id in book_ids]
-        volume_cut = (
-            float(np.percentile(volumes, self.small_book_volume_percentile))
-            if volumes
-            else 0.0
-        )
-        small_target = max(
-            1,
-            min(target, int(round(target * max(0.0, min(1.0, self.small_book_reserve_fraction))))),
-        )
-        profit_target = max(
-            0,
-            min(target - small_target, int(round(target * max(0.0, min(1.0, self.profit_book_reserve_fraction))))),
-        )
-
-        def add(book_id: int) -> None:
-            if book_id not in seen and len(selected) < target:
-                selected.append(book_id)
-                seen.add(book_id)
-
-        def small_key(book_id: int) -> tuple:
-            fp = self._fingerprint(validator, book_id)
-            cold = len(fp.round_trip_pnls) < self.min_realized_observations
-            under = (
-                fp.last_roundtrip == 0
-                or timestamp - fp.last_roundtrip > min(period, self.small_book_activity_period)
-            )
-            weak = fp.score_proxy < self.weak_book_proxy_floor
-            low_vol = my_by_book.get(book_id, 0.0) <= volume_cut
-            return (
-                0 if cold else 1,
-                0 if under else 1,
-                0 if low_vol else 1,
-                0 if weak else 1,
-                my_by_book.get(book_id, 0.0),
-                len(fp.round_trip_pnls),
-                fp.score_proxy,
-                book_id,
-            )
-
-        small_candidates = sorted(book_ids, key=small_key)
-        small_selected: set[int] = set()
-        for book_id in small_candidates:
-            fp = self._fingerprint(validator, book_id)
-            cold = len(fp.round_trip_pnls) < self.min_realized_observations
-            under = (
-                fp.last_roundtrip == 0
-                or timestamp - fp.last_roundtrip > min(period, self.small_book_activity_period)
-            )
-            weak = fp.score_proxy < self.weak_book_proxy_floor
-            low_vol = my_by_book.get(book_id, 0.0) <= volume_cut
-            if cold or under or weak or low_vol:
-                add(book_id)
-                small_selected.add(book_id)
-            if len(small_selected) >= small_target or len(selected) >= target:
-                break
-
-        profit_cut = max(net.book_score_p75, self.profit_book_min_proxy)
-        profit_candidates = sorted(
-            [book_id for book_id in book_ids if book_id not in seen],
-            key=lambda bid: (
-                self._fingerprint(validator, bid).score_proxy,
-                self._book_recent_pnl_mean(self._fingerprint(validator, bid)),
-                my_by_book.get(bid, 0.0),
-            ),
-            reverse=True,
-        )
-        profit_selected: set[int] = set()
-        for book_id in profit_candidates:
-            fp = self._fingerprint(validator, book_id)
-            if (
-                len(fp.round_trip_pnls) >= self.min_realized_observations
-                and fp.score_proxy >= profit_cut
-            ):
-                add(book_id)
-                profit_selected.add(book_id)
-            if len(profit_selected) >= profit_target or len(selected) >= target:
-                break
-
-        for book_id in small_candidates:
-            if book_id not in seen:
-                add(book_id)
-            if len(selected) >= target:
-                break
-
-        prev = self._active_books_by_validator.get(validator, set())
-        for book_id in sorted(prev):
-            add(book_id)
-            if len(selected) >= target:
-                break
-
-        remaining = [book_id for book_id in book_ids if book_id not in seen]
-        remaining.sort(
-            key=lambda bid: self._fingerprint(validator, bid).score_proxy,
-            reverse=True,
-        )
-        for book_id in remaining:
-            add(book_id)
-            if len(selected) >= target:
-                break
-
-        self._active_books_by_validator[validator] = set(selected)
-        small, profit = self._classify_activity_lanes(validator, selected, timestamp, target)
-        small |= small_selected
-        profit |= profit_selected
-        profit -= small
-        self._small_books_by_validator[validator] = small & set(selected)
-        self._profit_books_by_validator[validator] = profit & set(selected)
-        return selected
-
-    def _classify_activity_lanes(
-        self,
-        validator: str,
-        book_ids: list[int],
-        timestamp: int,
-        target: int,
-    ) -> tuple[set[int], set[int]]:
-        if not book_ids:
-            return set(), set()
-        my_by_book, _ = self._my_volumes(book_ids)
-        volumes = [my_by_book.get(book_id, 0.0) for book_id in book_ids]
-        volume_cut = (
-            float(np.percentile(volumes, self.small_book_volume_percentile))
-            if volumes
-            else 0.0
-        )
-        small_target = max(
-            1,
-            min(len(book_ids), int(round(target * max(0.0, min(1.0, self.small_book_reserve_fraction))))),
-        )
-        profit_target = max(
-            0,
-            min(len(book_ids), int(round(target * max(0.0, min(1.0, self.profit_book_reserve_fraction))))),
-        )
-
-        def small_key(book_id: int) -> tuple:
-            fp = self._fingerprint(validator, book_id)
-            cold = len(fp.round_trip_pnls) < self.min_realized_observations
-            under = (
-                fp.last_roundtrip == 0
-                or timestamp - fp.last_roundtrip > self.small_book_activity_period
-            )
-            low_vol = my_by_book.get(book_id, 0.0) <= volume_cut
-            weak = fp.score_proxy < self.weak_book_proxy_floor
-            return (
-                0 if cold else 1,
-                0 if under else 1,
-                0 if low_vol else 1,
-                0 if weak else 1,
-                my_by_book.get(book_id, 0.0),
-                len(fp.round_trip_pnls),
-                fp.score_proxy,
-                book_id,
-            )
-
-        small = set(sorted(book_ids, key=small_key)[:small_target])
-        profit_candidates = sorted(
-            [book_id for book_id in book_ids if book_id not in small],
-            key=lambda bid: (
-                self._fingerprint(validator, bid).score_proxy,
-                self._book_recent_pnl_mean(self._fingerprint(validator, bid)),
-                my_by_book.get(bid, 0.0),
-            ),
-            reverse=True,
-        )
-        profit: set[int] = set()
-        for book_id in profit_candidates:
-            fp = self._fingerprint(validator, book_id)
-            if (
-                len(fp.round_trip_pnls) >= self.min_realized_observations
-                and fp.score_proxy >= self.profit_book_min_proxy
-            ):
-                profit.add(book_id)
-            if len(profit) >= profit_target:
-                break
-        return small, profit
-
     def _effective_activity_period(self, coverage_pressure: float) -> int:
         if coverage_pressure <= 0:
             return self.activity_period
@@ -873,21 +490,9 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         book_id: int,
         timestamp: int,
         net: NetworkContext,
-        signal: BookSignal | None,
     ) -> bool:
         if net.coverage_pressure <= 0:
             return False
-        # If we cannot form a valid signal (missing/invalid BBO), don't "push" this book
-        # unless we already hold inventory (in which case we still want to unwind).
-        if signal is None:
-            fp0 = self._fingerprint(validator, book_id)
-            return abs(fp0.signed_position) > 0
-        # Extremely wide spreads are a maker trap; skip coverage pushing these books unless
-        # we already have inventory to exit.
-        rel_spread = signal.spread / max(signal.mid, 1e-9)
-        if rel_spread > self.coverage_push_max_relative_spread:
-            fp0 = self._fingerprint(validator, book_id)
-            return abs(fp0.signed_position) > 0
         fp = self._fingerprint(validator, book_id)
         period = self._effective_activity_period(net.coverage_pressure)
         under_activity = (
@@ -1116,8 +721,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         seq = self._respond_seq[validator]
         self._respond_seq[validator] = seq + 1
         my_by_book, my_total = self._my_volumes(book_ids)
-        if not self.peer_scan_enabled:
-            return {book_id: 0.0 for book_id in book_ids}, my_total, 0.0
 
         cache = self._volume_scan_cache.get(validator)
         book_key = tuple(book_ids)
@@ -1175,22 +778,19 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             else 0.0
         )
 
+        total_wealth = 0.0
         baseline = self._ensure_pnl_baseline()
-        if self.portfolio_scan_enabled:
-            total_wealth = 0.0
-            capital_per_book = baseline / max(len(book_ids), 1)
-            for book_id in book_ids:
-                account = self.accounts.get(book_id)
-                book = state.books.get(book_id)
-                if account is None or book is None or not book.bids or not book.asks:
-                    continue
-                mid = (book.bids[0].price + book.asks[0].price) / 2
-                total_wealth += self._account_wealth(account, mid)
-            portfolio_ratio = total_wealth / max(
-                capital_per_book * len(book_ids), 1e-9
-            )
-        else:
-            portfolio_ratio = 1.0
+        capital_per_book = baseline / max(len(book_ids), 1)
+        for book_id in book_ids:
+            account = self.accounts.get(book_id)
+            book = state.books.get(book_id)
+            if account is None or book is None or not book.bids or not book.asks:
+                continue
+            mid = (book.bids[0].price + book.asks[0].price) / 2
+            total_wealth += self._account_wealth(account, mid)
+        portfolio_ratio = total_wealth / max(
+            capital_per_book * len(book_ids), 1e-9
+        )
 
         alpha_unlocked = book_median >= self.fleet_alpha_unlock_median
         if portfolio_ratio < 0.92:
@@ -1369,32 +969,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         if pos < -1e-8:
             return (fingerprint.entry_price - mid) / fingerprint.entry_price
         return 0.0
-
-    def _projected_market_exit_return(
-        self,
-        account,
-        book: Book,
-        fingerprint: BookFingerprint,
-        direction: OrderDirection,
-    ) -> float:
-        """Approximate net return for a forced market exit, including visible taker fees."""
-        if (
-            fingerprint.entry_price is None
-            or fingerprint.entry_price <= 0
-            or not book.bids
-            or not book.asks
-        ):
-            return 0.0
-        if direction == OrderDirection.SELL:
-            exit_price = book.bids[0].price
-            raw_return = (exit_price - fingerprint.entry_price) / fingerprint.entry_price
-        else:
-            exit_price = book.asks[0].price
-            raw_return = (fingerprint.entry_price - exit_price) / fingerprint.entry_price
-        fees = getattr(account, "fees", None)
-        taker_fee = max(float(getattr(fees, "taker_fee_rate", 0.0) or 0.0), 0.0)
-        maker_fee = max(float(getattr(fees, "maker_fee_rate", 0.0) or 0.0), 0.0)
-        return raw_return - taker_fee - maker_fee
 
     def _position_notional(self, fingerprint: BookFingerprint, mid: float) -> float:
         return abs(fingerprint.signed_position) * max(mid, 0.0)
@@ -1620,14 +1194,15 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         allow_bid: bool,
         allow_ask: bool,
         under_activity: bool,
-        extra_ticks: int = 0,
-        min_profit: float | None = None,
+        focus: bool = False,
     ) -> tuple[float, float]:
         """
         If we hold inventory, bias quotes to complete the round-trip faster.
         This targets validator Kappa unlocking: book needs >= min_realized_observations realized round-trips.
         """
-        ticks = self.roundtrip_complete_ticks + max(0, int(extra_ticks))
+        ticks = self.roundtrip_complete_ticks + (
+            self.focus_roundtrip_complete_ticks_add if focus else 0
+        )
         if ticks <= 0 or not book.bids or not book.asks:
             return bid, ask
         if fingerprint.signed_position == 0:
@@ -1636,7 +1211,7 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             return bid, ask
         if fingerprint.signed_position < 0 and not allow_bid:
             return bid, ask
-        if self.roundtrip_complete_only_when_cold and (
+        if (not focus) and self.roundtrip_complete_only_when_cold and (
             len(fingerprint.round_trip_pnls) >= self.min_realized_observations and not under_activity
         ):
             return bid, ask
@@ -1650,28 +1225,16 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             # Too tight to improve without risking postOnly/contract violations.
             return bid, ask
 
-        min_profit = self.roundtrip_min_profit if min_profit is None else min_profit
+        ticks = max(0, min(int(ticks), 6))
         improve = ticks * tick
         if fingerprint.signed_position > 0:
             # Long inventory: improve ask (sell) towards the touch to realize.
             target_ask = max(best_bid + tick, min(best_ask - improve, ask))
             ask = round(target_ask, dec)
-            if fingerprint.entry_price and fingerprint.entry_price > 0:
-                min_profitable_ask = round(
-                    fingerprint.entry_price * (1.0 + min_profit),
-                    dec,
-                )
-                ask = max(ask, min_profitable_ask)
         else:
             # Short inventory: improve bid (buy) towards the touch to cover.
             target_bid = min(best_ask - tick, max(best_bid + improve, bid))
             bid = round(target_bid, dec)
-            if fingerprint.entry_price and fingerprint.entry_price > 0:
-                max_profitable_bid = round(
-                    fingerprint.entry_price * (1.0 - min_profit),
-                    dec,
-                )
-                bid = min(bid, max_profitable_bid)
 
         # Re-apply postOnly buffer safety in case spread tightens further.
         bid, ask = self._apply_postonly_buffer(book, bid, ask)
@@ -1753,29 +1316,8 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             self.simulation_config.volumeDecimals,
         )
 
-    def _has_live_quote(
-        self,
-        account,
-        side: OrderDirection,
-        price: float,
-        fingerprint: BookFingerprint | None = None,
-    ) -> bool:
-        dead = fingerprint.dead_order_ids if fingerprint else set()
-        return any(
-            order.id not in dead and order.side == side and order.price == price
-            for order in (account.orders or [])
-        )
-
-    def _has_live_side(
-        self,
-        account,
-        side: OrderDirection,
-        fingerprint: BookFingerprint,
-    ) -> bool:
-        return any(
-            order.id not in fingerprint.dead_order_ids and order.side == side
-            for order in (account.orders or [])
-        )
+    def _has_live_quote(self, account, side: OrderDirection, price: float) -> bool:
+        return any(order.side == side and order.price == price for order in account.orders)
 
     def _open_orders(self, account) -> dict[int, object]:
         return {order.id: order for order in (account.orders or [])}
@@ -1792,21 +1334,13 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         ask_price: float,
         allow_bid: bool,
         allow_ask: bool,
-        fingerprint: BookFingerprint,
-        accept_any_live: bool = False,
     ) -> bool:
-        if accept_any_live:
-            if allow_bid and not self._has_live_side(account, OrderDirection.BUY, fingerprint):
-                return True
-            if allow_ask and not self._has_live_side(account, OrderDirection.SELL, fingerprint):
-                return True
-            return False
         if allow_bid and not self._has_live_quote(
-            account, OrderDirection.BUY, bid_price, fingerprint
+            account, OrderDirection.BUY, bid_price
         ):
             return True
         if allow_ask and not self._has_live_quote(
-            account, OrderDirection.SELL, ask_price, fingerprint
+            account, OrderDirection.SELL, ask_price
         ):
             return True
         return False
@@ -1822,9 +1356,7 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
     ) -> bool:
         live = self._open_orders(account)
         pos = fingerprint.signed_position
-        for order_id, order in live.items():
-            if order_id in fingerprint.dead_order_ids:
-                continue
+        for order in live.values():
             if pos > 1e-8 and order.side == OrderDirection.SELL:
                 continue
             if pos < -1e-8 and order.side == OrderDirection.BUY:
@@ -1854,18 +1386,8 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         allow_ask: bool,
         prices_changed: bool,
         min_refresh: int | None = None,
-        accept_any_live: bool = False,
-        price_requote: bool = True,
     ) -> bool:
-        if self._missing_target_quotes(
-            account,
-            bid_price,
-            ask_price,
-            allow_bid,
-            allow_ask,
-            fingerprint,
-            accept_any_live=accept_any_live,
-        ):
+        if self._missing_target_quotes(account, bid_price, ask_price, allow_bid, allow_ask):
             return True
         if self._has_stale_quotes(
             account, bid_price, ask_price, allow_bid, allow_ask, fingerprint
@@ -1875,7 +1397,7 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         refresh_cap = min_refresh if min_refresh is not None else self.min_refresh_interval
         if fingerprint.last_plan_ts and elapsed < refresh_cap:
             return False
-        if price_requote and prices_changed:
+        if prices_changed:
             return True
         return False
 
@@ -1911,8 +1433,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         for order_id, order in live.items():
             if len(cancel_ids) >= max_cancels:
                 break
-            if order_id in fingerprint.dead_order_ids:
-                continue
             if pos > 1e-8 and order.side == OrderDirection.SELL:
                 continue
             if pos < -1e-8 and order.side == OrderDirection.BUY:
@@ -2163,38 +1683,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         guidance.ask_size_mult = max(guidance.ask_size_mult, 0.35)
         return guidance
 
-    def _apply_lane_guidance(
-        self,
-        guidance: AdvisoryGuidance,
-        signal: BookSignal | None,
-        *,
-        small_activity: bool,
-        profit_book: bool,
-    ) -> AdvisoryGuidance:
-        if signal is None:
-            return guidance
-        if small_activity:
-            # Low-activity books need fills, but not at any price. Keep quotes close
-            # unless flow is explicitly toxic; inventory/force-close logic still guards PnL.
-            if not signal.toxic:
-                guidance.bid_ticks_back = min(guidance.bid_ticks_back, 1)
-                guidance.ask_ticks_back = min(guidance.ask_ticks_back, 1)
-                guidance.bid_size_mult = max(guidance.bid_size_mult, 1.0)
-                guidance.ask_size_mult = max(guidance.ask_size_mult, 1.0)
-                guidance.reasons.append("lane:small_fill")
-            return guidance
-        if profit_book and not signal.toxic:
-            guidance.bid_size_mult = max(
-                guidance.bid_size_mult,
-                min(self.profit_book_size_mult, 1.5),
-            )
-            guidance.ask_size_mult = max(
-                guidance.ask_size_mult,
-                min(self.profit_book_size_mult, 1.5),
-            )
-            guidance.reasons.append("lane:profit")
-        return guidance
-
     def _apply_advisory_sides(
         self,
         allow_bid: bool,
@@ -2245,23 +1733,9 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         self._network_ctx[validator] = net
         tiers = self._assign_tiers(validator, book_ids, net, peer_ratio_by_book)
         self._tier_cache[validator] = tiers
-        prep_ids = book_ids
-        if self.fast_scoring_mode and self.active_books_target and self.active_books_target > 0:
-            prep_ids = self._fast_active_book_ids(
-                validator, book_ids, state.timestamp, net
-            )
-        else:
-            small, profit = self._classify_activity_lanes(
-                validator, prep_ids, state.timestamp, self._active_target_size(len(book_ids))
-            )
-            self._small_books_by_validator[validator] = small
-            self._profit_books_by_validator[validator] = profit
 
         books: dict[int, TickBookPrep] = {}
-        for book_id in prep_ids:
-            book = state.books.get(book_id)
-            if book is None:
-                continue
+        for book_id, book in state.books.items():
             signal = self._signal(validator, book_id, book)
             fp = self._fingerprint(validator, book_id)
             ts, tl, mom = self._trend_from_fingerprint(fp)
@@ -2271,10 +1745,10 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
                 trend_long=tl,
                 momentum_align=mom,
                 coverage_push=self._book_needs_coverage_push(
-                    validator, book_id, state.timestamp, net, signal
+                    validator, book_id, state.timestamp, net
                 ),
             )
-        fleet_skew = self._compute_fleet_inventory_skew(state, prep_ids)
+        fleet_skew = self._compute_fleet_inventory_skew(state, book_ids)
         ctx = TickContext(
             validator=validator,
             timestamp=state.timestamp,
@@ -2283,8 +1757,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             books=books,
             peer_ratio_by_book=peer_ratio_by_book,
             fleet_inventory_skew=fleet_skew,
-            small_books=set(self._small_books_by_validator.get(validator, set())) & set(prep_ids),
-            profit_books=set(self._profit_books_by_validator.get(validator, set())) & set(prep_ids),
         )
         ctx.plans = self._compile_tick_plans(ctx, state)
         return ctx
@@ -2298,26 +1770,41 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         # If configured, concentrate on a subset of books to reduce volume while still
         # meeting validator max_inactive_books constraints.
         allowed: set[int] | None = None
-        if (
-            self.fast_scoring_mode
-            and self.active_books_target
-            and self.active_books_target > 0
-        ):
-            allowed = set(ctx.books.keys())
-        elif self.active_books_target and self.active_books_target > 0:
-            target = self._active_target_size(len(state.books))
+        focus_set: set[int] = set()
+        if self.active_books_target and self.active_books_target > 0:
+            target = min(int(self.active_books_target), len(state.books))
             prev = self._active_books_by_validator.get(ctx.validator, set())
-            def _tradable(bid: int) -> bool:
-                prep = ctx.books.get(bid)
-                if not prep or prep.signal is None:
-                    return False
-                rel = prep.signal.spread / max(prep.signal.mid, 1e-9)
-                return rel <= self.coverage_push_max_relative_spread
+            # Always include books needing coverage push (kappa-cold / under-activity / weak tail).
+            needs_base = [bid for bid, prep in ctx.books.items() if prep.coverage_push]
 
-            # Always include books needing coverage push (kappa-cold / under-activity),
-            # but prefer books we can actually trade without getting stuck as a pure maker.
-            needs = [bid for bid, prep in ctx.books.items() if prep.coverage_push]
-            needs.sort(key=lambda bid: (0 if _tradable(bid) else 1, bid))
+            # Additionally pin the worst 1–N books to the active set so the *minimum*
+            # per-book roundtrip metrics can improve (min-roundtrip is dominated by one laggard).
+            focus: list[int] = []
+            if self.focus_books_target and self.focus_books_target > 0:
+                candidates: list[tuple[int, int, int, int]] = []
+                for bid in state.books.keys():
+                    fp = self._fingerprint(ctx.validator, bid)
+                    # Smaller: fewer realized round-trips; older last activity is worse.
+                    rt_count = len(fp.round_trip_pnls)
+                    last = fp.last_roundtrip if fp.last_roundtrip > 0 else fp.last_position_open_ts
+                    last = last if last > 0 else 0
+                    candidates.append((rt_count, last, bid, bid))
+                # Prefer books with fewer samples; then those not recently round-tripped.
+                candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+                focus = [bid for *_ignore, bid in candidates[: self.focus_books_target]]
+                focus_set = set(focus)
+
+                # Light, throttled logging so we can verify focus selection from logs.
+                last_log = self._last_focus_log_ts.get(ctx.validator, 0)
+                if last_log == 0 or state.timestamp - last_log >= 300_000_000_000:  # first tick or ~5 min sim
+                    bt.logging.info(
+                        f"FOCUS books (target={self.focus_books_target}): {focus} "
+                        f"rt_counts={[len(self._fingerprint(ctx.validator, b).round_trip_pnls) for b in focus]}"
+                    )
+                    self._last_focus_log_ts[ctx.validator] = state.timestamp
+
+            # Order needs with focus first to guarantee inclusion.
+            needs = list(dict.fromkeys(focus + needs_base))
             allowed = set(needs[:target])
             if len(allowed) < target:
                 # Keep prior active set for stability, then fill with lowest-id remainder.
@@ -2326,25 +1813,16 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
                         break
                     allowed.add(bid)
             if len(allowed) < target:
-                # Fill remaining with strongest (highest score_proxy) books to stabilize the median,
-                # rather than arbitrary low ids.
-                remaining = [bid for bid in state.books.keys() if bid not in allowed]
-                remaining.sort(
-                    key=lambda bid: self._fingerprint(ctx.validator, bid).score_proxy,
-                    reverse=True,
-                )
-                for bid in remaining:
+                for bid in sorted(state.books.keys()):
                     if len(allowed) >= target:
                         break
                     allowed.add(bid)
             self._active_books_by_validator[ctx.validator] = allowed
+        # Persist focus books for execution-phase logic.
+        ctx.focus_books = focus_set
 
-        iter_ids = sorted(allowed) if allowed is not None else sorted(state.books.keys())
-        for book_id in iter_ids:
-            if book_id not in ctx.books:
-                continue
-            book = state.books.get(book_id)
-            if book is None:
+        for book_id, book in state.books.items():
+            if allowed is not None and book_id not in allowed:
                 continue
             prep = ctx.books[book_id]
             tier = ctx.tiers.get(book_id, BookTier.NEUTRAL)
@@ -2414,17 +1892,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             return None
         account = self.accounts[book_id]
         fingerprint = self._fingerprint(ctx.validator, book_id)
-        small_books = getattr(ctx, "small_books", set())
-        profit_books = getattr(ctx, "profit_books", set())
-        small_activity = book_id in small_books
-        profit_book = book_id in profit_books and not small_activity
-        if (
-            self.market_close_reentry_cooldown > 0
-            and fingerprint.last_market_close_ts > 0
-            and state.timestamp - fingerprint.last_market_close_ts < self.market_close_reentry_cooldown
-            and abs(fingerprint.signed_position) < self.min_order_size
-        ):
-            return BookActionPlan(book_id=book_id)
         if self._volume_ratio(account) >= self.volume_soft_cap:
             return None
         quantity = round(
@@ -2434,12 +1901,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         allow_bid, allow_ask = self._apply_inventory_skew(fingerprint, True, True)
         guidance = self._build_advisory(
             prep, tier, ctx.net, fingerprint, ctx.fleet_inventory_skew
-        )
-        guidance = self._apply_lane_guidance(
-            guidance,
-            prep.signal,
-            small_activity=small_activity,
-            profit_book=profit_book,
         )
         bootstrap = prep.coverage_push
         bid_price, ask_price = self._prices(
@@ -2462,19 +1923,9 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             allow_bid=allow_bid,
             allow_ask=allow_ask,
             under_activity=under_activity,
-            extra_ticks=self.small_book_roundtrip_ticks_add if small_activity else 0,
-            min_profit=(
-                self.small_book_min_profit
-                if small_activity
-                else self.profit_book_min_profit
-                if profit_book
-                else None
-            ),
+            focus=book_id in ctx.focus_books,
         )
         min_refresh = self._effective_min_refresh_interval(prep, fingerprint)
-        if small_activity:
-            min_refresh = min(min_refresh, self.small_book_requote_interval)
-        stable_flat = abs(fingerprint.signed_position) < self.min_order_size
         if not self._should_requote(
             fingerprint,
             state.timestamp,
@@ -2486,8 +1937,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             allow_ask,
             prices_changed,
             min_refresh=min_refresh,
-            accept_any_live=stable_flat,
-            price_requote=not stable_flat,
         ):
             return BookActionPlan(book_id=book_id)
         cancel_ids = self._collect_cancel_ids(
@@ -2499,44 +1948,20 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             allow_ask,
             fingerprint,
             prices_changed,
-            max_cancels=(
-                0
-                if stable_flat
-                else
-                self.small_book_max_cancels
-                if small_activity and abs(fingerprint.signed_position) < self.min_order_size
-                else self._max_cancel_batch(prep)
-            ),
+            max_cancels=self._max_cancel_batch(prep),
         )
-        if small_activity:
-            quantity = round(
-                max(self.min_order_size, self.min_quote_quantity),
-                self.simulation_config.volumeDecimals,
-            )
         bid_qty = self._apply_advisory_size(quantity, OrderDirection.BUY, guidance)
         ask_qty = self._apply_advisory_size(quantity, OrderDirection.SELL, guidance)
         place_bid = (
             allow_bid
             and bid_qty > 0
-            and not self._has_live_quote(
-                account, OrderDirection.BUY, bid_price, fingerprint
-            )
-            and not (
-                stable_flat
-                and self._has_live_side(account, OrderDirection.BUY, fingerprint)
-            )
+            and not self._has_live_quote(account, OrderDirection.BUY, bid_price)
             and self._postonly_place_allowed(book, OrderDirection.BUY, bid_price)
         )
         place_ask = (
             allow_ask
             and ask_qty > 0
-            and not self._has_live_quote(
-                account, OrderDirection.SELL, ask_price, fingerprint
-            )
-            and not (
-                stable_flat
-                and self._has_live_side(account, OrderDirection.SELL, fingerprint)
-            )
+            and not self._has_live_quote(account, OrderDirection.SELL, ask_price)
             and self._postonly_place_allowed(book, OrderDirection.SELL, ask_price)
         )
         return BookActionPlan(
@@ -2565,25 +1990,8 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         tier = ctx.tiers.get(book_id, BookTier.NEUTRAL)
         tier_params = self._tier_params(tier, ctx.net)
         fingerprint = self._fingerprint(ctx.validator, book_id)
-        small_books = getattr(ctx, "small_books", set())
-        profit_books = getattr(ctx, "profit_books", set())
-        small_activity = book_id in small_books
-        profit_book = book_id in profit_books and not small_activity
-        if (
-            self.market_close_reentry_cooldown > 0
-            and fingerprint.last_market_close_ts > 0
-            and state.timestamp - fingerprint.last_market_close_ts < self.market_close_reentry_cooldown
-            and abs(fingerprint.signed_position) < self.min_order_size
-        ):
-            return BookActionPlan(book_id=book_id)
         guidance = self._build_advisory(
             prep, tier, ctx.net, fingerprint, ctx.fleet_inventory_skew
-        )
-        guidance = self._apply_lane_guidance(
-            guidance,
-            signal,
-            small_activity=small_activity,
-            profit_book=profit_book,
         )
         bid_price, ask_price = self._prices(book, guidance)
         prices_changed = self._prices_changed_materially(
@@ -2603,14 +2011,7 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             allow_bid=True,  # allow flags refined below; completion uses inventory direction.
             allow_ask=True,
             under_activity=under_activity,
-            extra_ticks=self.small_book_roundtrip_ticks_add if small_activity else 0,
-            min_profit=(
-                self.small_book_min_profit
-                if small_activity
-                else self.profit_book_min_profit
-                if profit_book
-                else None
-            ),
+            focus=book_id in ctx.focus_books,
         )
         prices_changed = self._prices_changed_materially(
             fingerprint, bid_price, ask_price
@@ -2671,10 +2072,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
                 allow_ask = allow_ask and inventory_ratio < tier_params.inventory_limit * 0.85
             elif signal.depth_imbalance < -0.12:
                 allow_bid = allow_bid and inventory_ratio > -tier_params.inventory_limit * 0.85
-        if small_activity and can_trade and not signal.toxic:
-            margin = max(self.defensive_activity_margin, 0.10)
-            allow_bid = inventory_ratio < tier_params.inventory_limit + margin
-            allow_ask = inventory_ratio > -(tier_params.inventory_limit + margin)
         allow_bid, allow_ask = self._apply_inventory_skew(fingerprint, allow_bid, allow_ask)
         if (
             defense
@@ -2688,9 +2085,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             allow_ask = True
         allow_bid, allow_ask = self._apply_advisory_sides(allow_bid, allow_ask, guidance)
         min_refresh = self._effective_min_refresh_interval(prep, fingerprint)
-        if small_activity:
-            min_refresh = min(min_refresh, self.small_book_requote_interval)
-        stable_flat = abs(fingerprint.signed_position) < self.min_order_size
         if not self._should_requote(
             fingerprint,
             state.timestamp,
@@ -2702,8 +2096,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             allow_ask,
             prices_changed,
             min_refresh=min_refresh,
-            accept_any_live=stable_flat,
-            price_requote=not stable_flat,
         ):
             return BookActionPlan(book_id=book_id)
         cancel_ids = self._collect_cancel_ids(
@@ -2715,28 +2107,11 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             allow_ask,
             fingerprint,
             prices_changed,
-            max_cancels=(
-                0
-                if stable_flat
-                else
-                self.small_book_max_cancels
-                if small_activity and abs(fingerprint.signed_position) < self.min_order_size
-                else self._max_cancel_batch(prep)
-            ),
+            max_cancels=self._max_cancel_batch(prep),
         )
         quantity = self._quote_size(
             fingerprint, signal, account, tier_params, under_activity
         )
-        if small_activity:
-            quantity = round(
-                max(self.min_order_size, self.min_quote_quantity),
-                self.simulation_config.volumeDecimals,
-            )
-        elif profit_book:
-            quantity = round(
-                min(quantity * self.profit_book_size_mult, self.max_quantity),
-                self.simulation_config.volumeDecimals,
-            )
         if bootstrap:
             quantity = max(
                 self.min_order_size,
@@ -2747,25 +2122,13 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         place_bid = (
             allow_bid
             and bid_qty > 0
-            and not self._has_live_quote(
-                account, OrderDirection.BUY, bid_price, fingerprint
-            )
-            and not (
-                stable_flat
-                and self._has_live_side(account, OrderDirection.BUY, fingerprint)
-            )
+            and not self._has_live_quote(account, OrderDirection.BUY, bid_price)
             and self._postonly_place_allowed(book, OrderDirection.BUY, bid_price)
         )
         place_ask = (
             allow_ask
             and ask_qty > 0
-            and not self._has_live_quote(
-                account, OrderDirection.SELL, ask_price, fingerprint
-            )
-            and not (
-                stable_flat
-                and self._has_live_side(account, OrderDirection.SELL, fingerprint)
-            )
+            and not self._has_live_quote(account, OrderDirection.SELL, ask_price)
             and self._postonly_place_allowed(book, OrderDirection.SELL, ask_price)
         )
         if self.advisory_log and guidance.reasons:
@@ -2796,47 +2159,25 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         book_id = plan.book_id
         account = self.accounts[book_id]
         fingerprint = self._fingerprint(ctx.validator, book_id)
-        live_ids = set(self._open_orders(account)) - fingerprint.dead_order_ids
+        live_ids = set(self._open_orders(account))
         acted = False
         cap = self.max_instructions_per_book
         sim_floor = float(getattr(self.simulation_config, "minOrderSize", 0.0) or 0.0)
         floor = max(self.min_order_size, sim_floor, self.quantity)
-        small_books = getattr(ctx, "small_books", set())
-        profit_books = getattr(ctx, "profit_books", set())
-        small_activity = book_id in small_books
-        profit_book = book_id in profit_books and not small_activity
 
         # Force-close stuck inventory to accelerate realized observations (Kappa unlock) and
         # keep books recently active (validator activity sampling).
-        force_after = self.force_roundtrip_close_after
-        min_force_return = self.force_roundtrip_close_min_return
-        if small_activity:
-            force_after = min(force_after, self.small_book_force_close_after)
-            min_force_return = self.small_book_force_close_min_return
-        elif profit_book:
-            force_after = max(force_after, self.profit_book_force_close_after)
-            min_force_return = self.profit_book_force_close_min_return
         if (
-            force_after > 0
+            self.force_roundtrip_close_after > 0
+            and (not self.force_roundtrip_close_focus_only or book_id in ctx.focus_books)
             and abs(fingerprint.signed_position) >= floor
             and self._book_instruction_count(response, book_id) < cap
         ):
-            if (
-                self.market_close_reentry_cooldown > 0
-                and fingerprint.last_market_close_ts > 0
-                and state.timestamp - fingerprint.last_market_close_ts < self.market_close_reentry_cooldown
-            ):
-                return
             period = self._effective_activity_period(ctx.net.coverage_pressure)
             under_activity = (
                 fingerprint.last_roundtrip == 0
                 or state.timestamp - fingerprint.last_roundtrip > period
             )
-            if small_activity:
-                under_activity = (
-                    fingerprint.last_roundtrip == 0
-                    or state.timestamp - fingerprint.last_roundtrip > self.small_book_activity_period
-                )
             kappa_cold = len(fingerprint.round_trip_pnls) < self.min_realized_observations
             should_force = True
             if self.force_roundtrip_close_only_when_cold:
@@ -2851,8 +2192,14 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             if (
                 should_force
                 and anchor_ts > 0
-                and state.timestamp - anchor_ts >= force_after
+                and state.timestamp - anchor_ts >= self.force_roundtrip_close_after
             ):
+                cancel_batch = list(live_ids) if self.force_roundtrip_close_cancel_all else []
+                for order_id in cancel_batch:
+                    if self._book_instruction_count(response, book_id) >= cap - 1:
+                        break
+                    response.cancel_order(book_id, order_id)
+
                 qty = round(
                     min(abs(fingerprint.signed_position), self.max_quantity),
                     self.simulation_config.volumeDecimals,
@@ -2863,16 +2210,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
                         if fingerprint.signed_position > 0
                         else OrderDirection.BUY
                     )
-                    projected_return = self._projected_market_exit_return(
-                        account, state.books[book_id], fingerprint, direction
-                    )
-                    if projected_return < min_force_return:
-                        return
-                    cancel_batch = list(live_ids) if self.force_roundtrip_close_cancel_all else []
-                    for order_id in cancel_batch:
-                        if self._book_instruction_count(response, book_id) >= cap - 1:
-                            break
-                        response.cancel_order(book_id, order_id)
                     response.market_order(
                         book_id=book_id,
                         direction=direction,
@@ -2881,10 +2218,47 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
                     )
                     bt.logging.info(
                         f"BOOK {book_id} : FORCED ROUNDTRIP CLOSE dir={direction.name} qty={qty} "
-                        f"pos={fingerprint.signed_position:.6f} projected_return={projected_return:.6f} "
-                        f"score_proxy={fingerprint.score_proxy:.4f} kappa_cold={kappa_cold} under_activity={under_activity}"
+                        f"pos={fingerprint.signed_position:.6f} kappa_cold={kappa_cold} under_activity={under_activity}"
                     )
-                    fingerprint.last_market_close_ts = state.timestamp
+                    fingerprint.last_plan_ts = state.timestamp
+                    fingerprint.last_bid_price = None
+                    fingerprint.last_ask_price = None
+                    return
+
+        # Focus-only "seed trade" for low-liquidity books: if we're flat and the book is
+        # cold/under-active for long enough, do a minimal market order to guarantee at
+        # least one fill on that book. This addresses the common failure mode where the
+        # weakest books never trade → min_roundtrip_volume stagnates.
+        if (
+            self.focus_force_trade_after > 0
+            and book_id in ctx.focus_books
+            and fingerprint.signed_position == 0
+            and self._book_instruction_count(response, book_id) < cap
+        ):
+            period = self._effective_activity_period(ctx.net.coverage_pressure)
+            under_activity = (
+                fingerprint.last_roundtrip == 0
+                or state.timestamp - fingerprint.last_roundtrip > period
+            )
+            kappa_cold = len(fingerprint.round_trip_pnls) < self.min_realized_observations
+            anchor_ts = fingerprint.last_fill_ts if fingerprint.last_fill_ts > 0 else fingerprint.last_roundtrip
+            if (kappa_cold or under_activity) and (
+                anchor_ts == 0 or state.timestamp - anchor_ts >= self.focus_force_trade_after
+            ):
+                # Alternate direction deterministically to avoid building one-sided fleet skew.
+                direction = OrderDirection.BUY if (book_id % 2 == 0) else OrderDirection.SELL
+                qty = round(min(floor, self.max_quantity), self.simulation_config.volumeDecimals)
+                if qty >= floor:
+                    response.market_order(
+                        book_id=book_id,
+                        direction=direction,
+                        quantity=qty,
+                        stp=STP.CANCEL_BOTH,
+                    )
+                    bt.logging.info(
+                        f"BOOK {book_id} : FOCUS SEED TRADE dir={direction.name} qty={qty} "
+                        f"kappa_cold={kappa_cold} under_activity={under_activity}"
+                    )
                     fingerprint.last_plan_ts = state.timestamp
                     fingerprint.last_bid_price = None
                     fingerprint.last_ask_price = None
@@ -2903,7 +2277,6 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
                     quantity=plan.emergency_qty,
                     stp=STP.CANCEL_BOTH,
                 )
-                fingerprint.last_market_close_ts = state.timestamp
                 fingerprint.last_emergency_ts = state.timestamp
                 fingerprint.last_plan_ts = state.timestamp
                 fingerprint.last_bid_price = None
@@ -2920,27 +2293,28 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             response.cancel_order(book_id, order_id)
             acted = True
 
-        # The plan was built against the request snapshot, but prices can move while
-        # prepare is running. Re-check postOnly safety immediately before sending.
-        books = getattr(state, "books", {}) or {}
-        book = books.get(book_id)
+        # Execution-time postOnly safety: BBO can move between plan and execute, turning a
+        # previously safe postOnly price into a crossing order (CONTRACT_VIOLATION). Re-check
+        # against latest book snapshot and buffer away if needed.
+        book = state.books.get(book_id)
         bid_price = plan.bid_price
         ask_price = plan.ask_price
-        place_bid = plan.place_bid
-        place_ask = plan.place_ask
-        if book is not None and book.bids and book.asks and (place_bid or place_ask):
+        if book is not None and book.bids and book.asks and (plan.place_bid or plan.place_ask):
             bid_price, ask_price = self._apply_postonly_buffer(book, bid_price, ask_price)
-            if place_bid and not self._postonly_place_allowed(
+            if plan.place_bid and not self._postonly_place_allowed(
                 book, OrderDirection.BUY, bid_price
             ):
-                place_bid = False
-            if place_ask and not self._postonly_place_allowed(
+                plan.place_bid = False
+            if plan.place_ask and not self._postonly_place_allowed(
                 book, OrderDirection.SELL, ask_price
             ):
-                place_ask = False
-
-        bid_qty = max(plan.bid_qty, floor) if place_bid else 0.0
-        if place_bid and account.quote_balance.free >= bid_qty * bid_price:
+                plan.place_ask = False
+        vol_dec = self.simulation_config.volumeDecimals
+        bid_qty = round(max(plan.bid_qty, floor), vol_dec) if plan.place_bid else 0.0
+        if plan.place_bid and bid_qty < floor:
+            bt.logging.info(f"BOOK {book_id} : SKIP BID qty<{floor} (bid_qty={bid_qty})")
+            bid_qty = 0.0
+        if plan.place_bid and account.quote_balance.free >= bid_qty * bid_price:
             if self._book_instruction_count(response, book_id) >= cap:
                 if acted:
                     fingerprint.last_plan_ts = state.timestamp
@@ -2957,8 +2331,11 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
             )
             fingerprint.last_bid_price = bid_price
             acted = True
-        ask_qty = max(plan.ask_qty, floor) if place_ask else 0.0
-        if place_ask and account.base_balance.free >= ask_qty:
+        ask_qty = round(max(plan.ask_qty, floor), vol_dec) if plan.place_ask else 0.0
+        if plan.place_ask and ask_qty < floor:
+            bt.logging.info(f"BOOK {book_id} : SKIP ASK qty<{floor} (ask_qty={ask_qty})")
+            ask_qty = 0.0
+        if plan.place_ask and account.base_balance.free >= ask_qty:
             if self._book_instruction_count(response, book_id) >= cap:
                 if acted:
                     fingerprint.last_plan_ts = state.timestamp
@@ -3027,43 +2404,12 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
 
         return sorted(ctx.plans.keys(), key=sort_key)
 
-    def _instruction_summary(self, response: FinanceAgentResponse) -> dict[str, int]:
-        limits = 0
-        markets = 0
-        cancels = 0
-        closes = 0
-        books: set[int] = set()
-        for instruction in response.instructions:
-            book_id = getattr(instruction, "bookId", None)
-            if book_id is not None:
-                books.add(int(book_id))
-            itype = getattr(instruction, "type", "")
-            if itype == "PLACE_ORDER_LIMIT":
-                limits += 1
-            elif itype == "PLACE_ORDER_MARKET":
-                markets += 1
-            elif itype == "CANCEL_ORDERS":
-                cancels += len(getattr(instruction, "cancellations", []) or [])
-            elif itype == "CLOSE_POSITIONS":
-                closes += len(getattr(instruction, "closes", []) or [])
-        return {
-            "instructions": len(response.instructions),
-            "limits": limits,
-            "markets": markets,
-            "cancels": cancels,
-            "closes": closes,
-            "books": len(books),
-        }
-
     def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
-        start = time.perf_counter()
         response = FinanceAgentResponse(agent_id=self.uid)
         self._sync_min_order_size_from_sim()
         ctx = self._prepare_tick(state)
-        prepared = time.perf_counter()
         for book_id in self._execution_order(ctx):
             self._execute_plan(response, state, ctx, ctx.plans[book_id])
-        executed = time.perf_counter()
         self._save_warm_snapshot(ctx)
         validator = ctx.validator
         if validator:
@@ -3081,59 +2427,7 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
                 publish_agent_metrics(self, ctx, orders=orders, cancels=cancels)
             except Exception:
                 pass
-        total = time.perf_counter() - start
-        summary = self._instruction_summary(response)
-        metrics = {
-            "prepare_s": prepared - start,
-            "execute_s": executed - prepared,
-            "total_s": total,
-            "plans": len(ctx.plans),
-            "books": len(state.books),
-            "coverage_pressure": ctx.net.coverage_pressure,
-            "kappa_ready_ratio": ctx.net.kappa_ready_ratio,
-            **summary,
-        }
-        self._last_response_metrics[validator] = metrics
-        seq = self._timing_seq[validator]
-        self._timing_seq[validator] = seq + 1
-        if (
-            total >= self.slow_response_warn_s
-            or (
-                self.response_timing_interval > 0
-                and seq % self.response_timing_interval == 0
-            )
-        ):
-            bt.logging.info(
-                "AGENT_TIMING "
-                f"total={total:.4f}s prepare={metrics['prepare_s']:.4f}s "
-                f"execute={metrics['execute_s']:.4f}s books={metrics['books']} "
-                f"plans={metrics['plans']} instructions={summary['instructions']} "
-                f"limits={summary['limits']} markets={summary['markets']} "
-                f"cancels={summary['cancels']} coverage={ctx.net.coverage_pressure:.3f} "
-                f"kappa_ready={ctx.net.kappa_ready_ratio:.3f}"
-            )
         return response
-
-    def report(
-        self,
-        state: MarketSimulationStateUpdate,
-        response: FinanceAgentResponse,
-    ) -> None:
-        """Compact report; avoids large per-instruction INFO log on the response path."""
-        validator = state.dendrite.hotkey
-        seq = self._compact_report_seq[validator]
-        self._compact_report_seq[validator] = seq + 1
-        if self.compact_report_interval <= 0 or seq % self.compact_report_interval != 0:
-            return
-        metrics = self._last_response_metrics.get(validator) or {}
-        summary = self._instruction_summary(response)
-        bt.logging.info(
-            "AGENT_REPORT "
-            f"t={state.timestamp} total={metrics.get('total_s', 0.0):.4f}s "
-            f"instructions={summary['instructions']} limits={summary['limits']} "
-            f"markets={summary['markets']} cancels={summary['cancels']} "
-            f"books_touched={summary['books']}"
-        )
 
     def _update_entry_on_add(
         self,
@@ -3181,6 +2475,10 @@ class MedianAlignedTierAgent(FinanceSimulationAgent):
         )
         if abs(previous_position) < 1e-12 and abs(next_position) > 1e-12:
             fingerprint.last_position_open_ts = event.timestamp
+
+        # Any fill counts as "activity" for this book.
+        if event.timestamp and event.timestamp > 0:
+            fingerprint.last_fill_ts = event.timestamp
 
         if closes_long or closes_short:
             if fingerprint.entry_price is not None and event.price > 0:
